@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CBS × DuckDB</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
+<style>
+  :root {
+    --paper: #F5F7F9; --panel: #FFFFFF; --ink: #1C2733; --muted: #5E6B78;
+    --line: #D9E0E7; --accent: #1F6FB2; --accent-ink: #FFFFFF; --error: #B3261E;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink);
+    font: 15px/1.45 "IBM Plex Sans", system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center;
+    padding: .9rem 1.25rem; background: var(--panel); border-bottom: 1px solid var(--line); }
+  h1 { font-size: 1.05rem; font-weight: 600; margin: 0 1rem 0 0; }
+  select, button { font: inherit; }
+  select { padding: .4rem .5rem; border: 1px solid var(--line); border-radius: 4px;
+    background: var(--panel); color: var(--ink); max-width: 100%; }
+  button { padding: .42rem 1rem; border: 0; border-radius: 4px; cursor: pointer;
+    background: var(--accent); color: var(--accent-ink); font-weight: 500; }
+  button:disabled { opacity: .45; cursor: default; }
+  button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #status { color: var(--muted); font-size: .88rem; }
+  #status.err { color: var(--error); }
+  main { display: flex; flex-direction: column; gap: 1rem; padding: 1rem 1.25rem; }
+  main > section { min-width: 0; }
+  h2 { font-size: .9rem; margin: 0 0 .5rem; font-weight: 600; }
+  .tables { background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    padding: .75rem; font-size: .85rem; }
+  #schema { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; align-items: flex-start; }
+  #schema summary { cursor: pointer; font-family: "IBM Plex Mono", monospace; }
+  #schema ul { margin: .25rem 0 .25rem 1rem; padding: 0; list-style: none; color: var(--muted);
+    font-family: "IBM Plex Mono", monospace; font-size: .78rem; }
+  .query { display: flex; flex-direction: column; gap: .6rem; }
+  .CodeMirror { height: 200px; border: 1px solid var(--line); border-radius: 4px;
+    font: 14px/1.5 "IBM Plex Mono", monospace; }
+  .runbar { display: flex; gap: .75rem; align-items: center; }
+  .hint { color: var(--muted); font-size: .82rem; }
+  #result { overflow: auto; max-height: 55vh; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 4px; }
+  #result:empty::before { content: 'Run a query to see results.'; display: block; padding: .75rem; color: var(--muted); font-size: .85rem; }
+  table { border-collapse: collapse; font-size: .84rem; width: max-content; min-width: 100%; }
+  th, td { padding: .3rem .65rem; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+  th { position: sticky; top: 0; background: #EEF2F6; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.null { color: #A3AEB9; }
+  #error { color: var(--error); font-family: "IBM Plex Mono", monospace; font-size: .85rem; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CBS × DuckDB</h1>
+  <select id="dataset" aria-label="CBS dataset"></select>
+  <button id="load" disabled>Load dataset</button>
+  <span id="status">Starting DuckDB…</span>
+</header>
+<main>
+  <section class="tables">
+    <h2>Tables</h2>
+    <div id="schema" class="hint">No dataset loaded.</div>
+  </section>
+  <section class="query">
+    <h2>Query</h2>
+    <textarea id="sql"></textarea>
+    <div class="runbar">
+      <button id="run" disabled>Run</button>
+      <span class="hint">Ctrl/⌘ + Enter</span>
+    </div>
+    <div id="error"></div>
+  </section>
+  <section>
+    <h2>Result</h2>
+    <div id="result"></div>
+  </section>
+</main>
+
+<script type="module">
+import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm";
+
+// Edit this list to change the available datasets (CBS table IDs).
+const DATASETS = [
+  ["83625NED", "Bestaande koopwoningen; gemiddelde verkoopprijzen, regio"],
+  ["85773NED", "Bestaande koopwoningen; verkoopprijzen prijsindex 2020=100"],
+  ["85036NED", "Gemiddelde WOZ-waarde van woningen; eigendom, regio"],
+  ["82235NED", "Voorraad woningen; standen en mutaties vanaf 1921"],
+  ["37296ned", "Bevolking; kerncijfers, 1950-2022"],
+];
+const API = "https://datasets.cbs.nl/odata/v1/CBS/";
+const MAX_ROWS = 1000;
+
+const $ = id => document.getElementById(id);
+const status = (msg, err = false) => { $("status").textContent = msg; $("status").className = err ? "err" : ""; };
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+$("dataset").innerHTML = DATASETS.map(([id, t]) => `<option value="${id}">${id}: ${esc(t)}</option>`).join("");
+
+const editor = CodeMirror.fromTextArea($("sql"), {
+  mode: "text/x-pgsql", lineNumbers: true, indentWithTabs: false,
+  extraKeys: { "Ctrl-Enter": () => runQuery(), "Cmd-Enter": () => runQuery() },
+});
+editor.setValue("-- Load a dataset, then write SQL here");
+
+// --- DuckDB init ---
+const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+const workerUrl = URL.createObjectURL(new Blob([`importScripts("${bundle.mainWorker}");`], { type: "text/javascript" }));
+const db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), new Worker(workerUrl));
+await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+URL.revokeObjectURL(workerUrl);
+const conn = await db.connect();
+status("DuckDB ready. Choose a dataset and load it.");
+$("load").disabled = false;
+
+// Fetch an OData entity set, following @odata.nextLink pages.
+async function fetchAll(url) {
+  const rows = [];
+  while (url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${url}`);
+    const j = await res.json();
+    rows.push(...j.value);
+    url = j["@odata.nextLink"];
+  }
+  return rows;
+}
+
+async function loadTable(name, rows) {
+  const file = `${name}.json`;
+  await db.registerFileText(file, JSON.stringify(rows));
+  await conn.query(`CREATE OR REPLACE TABLE "${name}" AS SELECT * FROM read_json_auto('${file}', format='array', sample_size=-1)`);
+  await db.dropFile(file);
+}
+
+async function loadDataset() {
+  const id = $("dataset").value;
+  $("load").disabled = $("run").disabled = true;
+  try {
+    // Clear previous dataset
+    const old = await conn.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='main'`);
+    for (const r of old.toArray()) await conn.query(`DROP TABLE "${r.table_name}"`);
+
+    status(`Loading ${id} structure…`);
+    const dims = await fetchAll(`${API}${id}/Dimensions`);
+    const tables = ["Observations", "MeasureCodes", ...dims.filter(d => d.ContainsCodes).map(d => `${d.Identifier}Codes`)];
+    for (const t of tables) {
+      status(`Loading ${id}: ${t}…`);
+      await loadTable(t, await fetchAll(`${API}${id}/${t}`));
+    }
+    await renderSchema();
+    editor.setValue(defaultQuery(dims));
+    const n = (await conn.query(`SELECT count(*) AS n FROM Observations`)).toArray()[0].n;
+    status(`${id} loaded: ${Number(n).toLocaleString("nl-NL")} observations.`);
+    $("run").disabled = false;
+  } catch (e) {
+    status(`Loading failed: ${e.message}`, true);
+  } finally {
+    $("load").disabled = false;
+  }
+}
+
+function defaultQuery(dims) {
+  const d = dims.filter(x => x.ContainsCodes);
+  const cols = ["m.Title AS onderwerp", ...d.map((x, i) => `d${i}.Title AS ${x.Identifier.toLowerCase()}`), "o.Value"];
+  const joins = ["JOIN MeasureCodes m ON o.Measure = m.Identifier",
+    ...d.map((x, i) => `JOIN ${x.Identifier}Codes d${i} ON o.${x.Identifier} = d${i}.Identifier`)];
+  return `SELECT ${cols.join(",\n       ")}\nFROM Observations o\n${joins.join("\n")}\nLIMIT 100;`;
+}
+
+async function renderSchema() {
+  const r = await conn.query(`SELECT table_name, column_name, data_type FROM information_schema.columns
+    WHERE table_schema='main' ORDER BY table_name, ordinal_position`);
+  const by = {};
+  for (const x of r.toArray()) (by[x.table_name] ??= []).push(`${x.column_name} ${x.data_type}`);
+  $("schema").innerHTML = Object.entries(by).map(([t, cols]) =>
+    `<details><summary>${esc(t)}</summary><ul>${cols.map(c => `<li>${esc(c)}</li>`).join("")}</ul></details>`).join("");
+}
+
+async function runQuery() {
+  if ($("run").disabled) return;
+  $("error").textContent = ""; $("run").disabled = true;
+  const t0 = performance.now();
+  try {
+    const res = await conn.query(editor.getValue());
+    const ms = Math.round(performance.now() - t0);
+    const fields = res.schema.fields;
+    const cols = fields.map((_, i) => res.getChildAt(i));
+    const shown = Math.min(res.numRows, MAX_ROWS);
+    let html = "<table><thead><tr>" + fields.map(f => `<th>${esc(f.name)}</th>`).join("") + "</tr></thead><tbody>";
+    for (let i = 0; i < shown; i++) {
+      html += "<tr>" + cols.map(c => {
+        const v = c.get(i);
+        if (v === null || v === undefined) return `<td class="null">null</td>`;
+        const num = typeof v === "number" || typeof v === "bigint";
+        return `<td${num ? ' class="num"' : ""}>${esc(num ? v.toString() : v)}</td>`;
+      }).join("") + "</tr>";
+    }
+    $("result").innerHTML = html + "</tbody></table>";
+    status(`${res.numRows.toLocaleString("nl-NL")} rows in ${ms} ms${res.numRows > MAX_ROWS ? ` (first ${MAX_ROWS} shown)` : ""}.`);
+  } catch (e) {
+    $("error").textContent = e.message;
+    $("result").innerHTML = "";
+  } finally {
+    $("run").disabled = false;
+  }
+}
+
+$("load").addEventListener("click", loadDataset);
+$("run").addEventListener("click", runQuery);
+</script>
+</body>
+</html>
